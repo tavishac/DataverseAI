@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+pandas
+scikit-learn
+numpy
+python-multipart
+openpyxl
+google-genai

@@ -1,0 +1,2720 @@
+PS D:\webp\data analysis\backend> python -m uvicorn main:app --reload
+>> 
+PS D:\webp\data analysis\backend> pip install fastapi uvicorn pandas openpyxl xlrd
+>> 
+pip install openai 
+
+
+PS D:\webp\data analysis\frontend> npm run dev
+>> 
+
+
+
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+import pandas as pd
+import io
+import numpy as np
+from sklearn.ensemble import IsolationForest
+import os
+import json
+import logging
+
+# Set up logging for better error visibility
+logging.basicConfig(level=logging.INFO)
+
+# Optional: OpenAI client for NLG summary
+client = None
+if os.environ.get("OPENAI_API_KEY"):
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+        logging.info("OpenAI client initialized for NLG summaries.")
+    except ImportError:
+        logging.warning("Warning: 'openai' library not installed. AI summary will be unavailable.")
+    except Exception as e:
+        logging.warning(f"Error initializing OpenAI client: {e}. AI summary will be unavailable.")
+else:
+    logging.info("OPENAI_API_KEY not found. AI summary will be unavailable.")
+
+
+app = FastAPI()
+
+# Enable CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+MAX_ROWS = 200000
+
+# ✅ Common Plotly config (used for all charts)
+PLOTLY_CONFIG = {
+    "displayModeBar": True,
+    "displaylogo": False,
+    "responsive": True,
+    "toImageButtonOptions": {
+        "format": "png",
+        "filename": "plot_download",
+        "height": 600,
+        "width": 800,
+        "scale": 2
+    }
+}
+
+
+def sanitize(obj):
+    """Recursively cleans numpy types and NaN values from dictionaries/lists for JSON serialization."""
+    if isinstance(obj, dict):
+        return {k: sanitize(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [sanitize(elem) for elem in obj]
+    elif isinstance(obj, (np.integer, int)):
+        return int(obj)
+    elif isinstance(obj, (np.floating, float)):
+        if np.isnan(obj) or np.isinf(obj):
+            return None
+        return float(obj)
+    elif isinstance(obj, (np.bool_, bool)):
+        return bool(obj)
+    elif pd.isna(obj):
+        return None
+    else:
+        return obj
+
+
+def feature_engineer(df: pd.DataFrame):
+    """
+    Performs basic feature engineering for date-like and long-text columns.
+    This helps in providing more features for the anomaly detection model.
+    """
+    # 1. Date Feature Engineering
+    date_like_cols = [
+        col for col in df.columns 
+        if df[col].dtype == 'object' and df[col].nunique() > 1 and df[col].nunique() < df.shape[0] * 0.9
+    ]
+
+    for col in date_like_cols:
+        try:
+            # Attempt to parse to datetime
+            dt_series = pd.to_datetime(df[col], errors='coerce')
+            # Only proceed if more than 50% of values are valid dates
+            if dt_series.notna().sum() / df.shape[0] > 0.5:
+                df[f'{col}_Month'] = dt_series.dt.month.astype('category')
+                df[f'{col}_DayOfWeek'] = dt_series.dt.day_name().astype('category')
+                df[f'{col}_IsWeekend'] = dt_series.dt.weekday >= 5
+        except Exception as e:
+            logging.debug(f"Date feature engineering failed for {col}: {e}")
+            pass
+
+    # 2. Text Feature Engineering (Length)
+    object_cols = df.select_dtypes(include=['object']).columns
+    for col in object_cols:
+        # Check if the column is high cardinality and has potentially meaningful text content
+        if df[col].nunique() > 50 and df.shape[0] > 100:
+            df[f'{col}_Length'] = df[col].astype(str).apply(len)
+
+    return df
+
+
+def detect_outliers(df: pd.DataFrame):
+    """Detects outliers using Isolation Forest on all numeric features."""
+    # Select only numeric columns that have at least some variance
+    numeric_cols = df.select_dtypes(include=np.number).columns
+    valid_numeric_cols = [
+        col for col in numeric_cols 
+        if df[col].nunique() > 1 and df[col].count() > 0
+    ]
+    
+    outliers = []
+
+    if len(valid_numeric_cols) >= 2 and df.shape[0] > 50:
+        # Impute NaNs with median for anomaly detection consistency
+        X = df[valid_numeric_cols].fillna(df[valid_numeric_cols].median())
+        
+        try:
+            model = IsolationForest(contamination='auto', random_state=42, n_jobs=-1)
+            model.fit(X)
+            is_outlier = model.predict(X)
+            outlier_indices = X[is_outlier == -1].index.tolist()
+            if outlier_indices:
+                outliers = [int(i) for i in outlier_indices]
+        except Exception as e:
+            logging.error(f"Isolation Forest failed: {e}")
+
+    return outliers
+
+
+def generate_nlg_summary(meta, summary, corr_pairs, outliers):
+    """Generates a cognitive summary using the OpenAI API (or Gemini API if configured)."""
+    if not client:
+        return "NLG Summary service is unavailable. Ensure the 'openai' library is installed and OPENAI_API_KEY is set."
+
+    # Subsetting the descriptive statistics for a cleaner prompt
+    key_stats = {}
+    for col, stats in summary.items():
+        if isinstance(stats, dict) and 'mean' in stats:
+            key_stats[col] = {
+                'mean': stats.get('mean', 'N/A'),
+                'std': stats.get('std', 'N/A'),
+                'min': stats.get('min', 'N/A'),
+                'max': stats.get('max', 'N/A'),
+                'unique': stats.get('unique', 'N/A'),
+                'dtype': next((c['dtype'] for c in meta['columns'] if c['name'] == col), 'unknown')
+            }
+
+    stats_json = json.dumps(key_stats, indent=2, default=str)[:3000]
+
+    corr_report = "\n".join([
+        f"- {p['x']} vs {p['y']}: {p['corr']:.3f}" for p in corr_pairs
+    ])
+
+    prompt = f"""
+    You are a helpful, senior data scientist. Analyze the provided dataset metadata, key statistics, and anomaly report.
+    The goal is to provide a quick, professional assessment for a data team.
+
+    1. Provide a **Cognitive Summary** (about 3 sentences) of the dataset's overall shape, focusing on key features (e.g., scale, balance, notable high/low variance columns).
+    2. Provide 2-3 **Actionable Recommendations** (e.g., handling missing data in a specific column, cleaning outliers, or potential modeling ideas based on correlations).
+    3. Format the response clearly using markdown. Use bold markdown (**text**) for key points.
+
+    ---
+    ### Dataset Metadata
+    Rows: {meta['rows']:,}
+    Columns: {meta['cols']}
+    Engineered Features Added: {sum(1 for c in meta['columns'] if c['is_engineered'])}
+
+    ### Top Correlations (Absolute Value)
+    {corr_report if corr_report else 'No strong correlations (|\rho| > 0.7) found.'}
+
+    ### Anomaly Report
+    Outliers Detected (IsolationForest): {len(outliers)} rows
+
+    ### Key Column Statistics Sample
+    {stats_json}
+    """
+
+    try:
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "You are a concise, analytical data science assistant who provides professional summaries and recommendations."},
+                {"role": "user", "content": prompt}
+            ]
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        logging.error(f"NLG Summary generation failed: {e}")
+        return f"NLG Summary unavailable due to API error: {e}"
+
+
+def analyze_dataframe(df: pd.DataFrame):
+    """Main data analysis workflow."""
+    # Drop rows/columns that are entirely NaN
+    df = df.dropna(how='all', axis=0).dropna(how='all', axis=1)
+    
+    # Store initial column names before engineering
+    original_column_names = df.columns.tolist()
+
+    df = feature_engineer(df)
+
+    # Limit to MAX_ROWS if the dataset is too large, but run analysis on the head
+    if df.shape[0] > MAX_ROWS:
+        logging.warning(f"Dataset truncated to {MAX_ROWS} rows for analysis.")
+        df = df.head(MAX_ROWS).copy()
+
+    # --- Metadata Calculation ---
+    meta = {
+        "rows": int(df.shape[0]),
+        "cols": int(df.shape[1]),
+        "columns": [
+            {
+                "name": str(col),
+                "dtype": str(df[col].dtype),
+                "missing": int(df[col].isna().sum()),
+                "unique": int(df[col].nunique(dropna=True)),
+                "is_engineered": any(x in str(col) for x in ['Month', 'DayOfWeek', 'Length', 'IsWeekend'])
+            }
+            for col in df.columns
+        ]
+    }
+
+    # --- Summary Statistics ---
+    summary = sanitize(df.describe(include="all").to_dict())
+    
+    # --- Correlation & Plot Generation ---
+    corr_pairs = []
+    figures = []
+    numeric_cols = df.select_dtypes(include=np.number)
+    numeric_cols_names = numeric_cols.columns.tolist()
+    categorical_cols_names = df.select_dtypes(include=['object', 'category']).columns.tolist()
+
+    # 1. Correlation Heatmap
+    if len(numeric_cols.columns) >= 2:
+        corr_matrix = numeric_cols.corr()
+        heatmap_fig = {
+            "id": "heatmap_corr",
+            "figure": {
+                "data": [{
+                    "z": corr_matrix.values.tolist(),
+                    "x": corr_matrix.columns.tolist(),
+                    "y": corr_matrix.columns.tolist(),
+                    "type": "heatmap",
+                    "colorscale": "Plasma", # Changed to Plasma for visibility
+                    "hovertemplate": "Correlation(%{x}, %{y}): %{z:.2f}<extra></extra>",
+                }],
+                "layout": {"title": {"text": "Correlation Heatmap"}, "height": 550, "width": 650},
+                "config": PLOTLY_CONFIG
+            }
+        }
+        figures.append(heatmap_fig)
+
+        # Top correlations extraction
+        corr_abs_matrix = corr_matrix.abs()
+        already_seen = set()
+        for i in corr_abs_matrix.columns:
+            for j in corr_abs_matrix.columns:
+                if i != j and (j, i) not in already_seen and abs(corr_matrix.loc[i, j]) >= 0.7:
+                    actual_corr = corr_matrix.loc[i, j]
+                    corr_pairs.append({"x": i, "y": j, "corr": float(actual_corr)})
+                    already_seen.add((i, j))
+        # Sort by absolute correlation and take top 10
+        corr_pairs = sorted(corr_pairs, key=lambda x: abs(x["corr"]), reverse=True)[:10]
+
+        # 2. Scatter plots for top correlated pairs
+        for pair in corr_pairs[:5]:
+            col_x, col_y = pair['x'], pair['y']
+            plot_df = df[[col_x, col_y]].dropna()
+            fig = {
+                "id": f"scatter_{col_x}_vs_{col_y}",
+                "figure": {
+                    "data": [{
+                        "x": plot_df[col_x].tolist(),
+                        "y": plot_df[col_y].tolist(),
+                        "mode": "markers",
+                        "type": "scatter",
+                        "marker": {"color": "#1f77b4", "size": 6}, # Default Plotly blue
+                        "name": f"{col_x} vs {col_y}",
+                        "hovertemplate": f"{col_x}: %{{x}}<br>{col_y}: %{{y}}<extra></extra>"
+                    }],
+                    "layout": {"title": {"text": f"Scatter Plot: {col_x} vs {col_y}"}, "height": 450},
+                    "config": PLOTLY_CONFIG
+                }
+            }
+            figures.append(fig)
+
+    # 3. Box plot (Numeric vs Low-Cardinality Category)
+    if numeric_cols_names and categorical_cols_names:
+        num_col = numeric_cols_names[0]
+        # Find a suitable categorical column (2 to 10 unique values)
+        cat_col = next((col for col in categorical_cols_names if 2 <= df[col].nunique() <= 10), None)
+        if cat_col:
+            fig = {
+                "id": f"boxplot_{num_col}_by_{cat_col}",
+                "figure": {
+                    "data": [{
+                        "y": df[num_col].tolist(),
+                        "x": df[cat_col].astype(str).tolist(),
+                        "type": "box",
+                        "boxpoints": 'outliers',
+                        "marker": {"color": "darkgreen"},
+                        "name": f"{num_col} by {cat_col}"
+                    }],
+                    "layout": {"title": {"text": f"Box Plot: {num_col} by {cat_col}"}, "height": 450},
+                    "config": PLOTLY_CONFIG
+                }
+            }
+            figures.append(fig)
+
+    # 4. Histograms (Numeric Distributions)
+    for col in numeric_cols_names:
+        fig = {
+            "id": f"hist_{col}",
+            "figure": {
+                "data": [{
+                    "x": numeric_cols[col].dropna().tolist(),
+                    "type": "histogram",
+                    "marker": {"color": "lightblue"},
+                    "nbinsx": 50 # Increase bin count for better detail
+                }],
+                "layout": {"title": {"text": f"Distribution of {col}"}, "height": 400},
+                "config": PLOTLY_CONFIG
+            }
+        }
+        figures.append(fig)
+
+    # 5. Bar charts (Categorical Counts)
+    categorical_cols = df.select_dtypes(include=['object', 'category', 'bool'])
+    for col in categorical_cols.columns:
+        top_counts = df[col].value_counts(dropna=True).head(10)
+        if not top_counts.empty and top_counts.shape[0] > 1:
+            fig = {
+                "id": f"bar_{col}",
+                "figure": {
+                    "data": [{
+                        "x": top_counts.index.astype(str).tolist(),
+                        "y": top_counts.values.tolist(),
+                        "type": "bar",
+                        "marker": {"color": "teal"}
+                    }],
+                    "layout": {"title": {"text": f"Top 10 Counts of {col}"}, "height": 450},
+                    "config": PLOTLY_CONFIG
+                }
+            }
+            figures.append(fig)
+            
+    # --- Anomaly Detection and NLG ---
+    outliers = detect_outliers(df)
+    nlg_summary = generate_nlg_summary(meta, summary, corr_pairs, outliers)
+    raw_data_sample = sanitize(df[original_column_names].head(50).to_dict('records'))
+
+
+    return {
+        "meta": meta,
+        "summary": summary,
+        "corr_pairs": corr_pairs,
+        "figures": figures,
+        "outliers": outliers,
+        "nlg_summary": nlg_summary,
+        "raw_data_sample": raw_data_sample,
+        "column_names": original_column_names # Return original names for display
+    }
+
+
+@app.post("/analyze")
+async def analyze(file: UploadFile = File(...)):
+    """API endpoint to upload and analyze a data file."""
+    filename = file.filename.lower()
+    contents = await file.read()
+    df = pd.DataFrame()
+    
+    try:
+        if filename.endswith(".csv"):
+            # Attempt to read CSV with common encodings for robustness
+            try:
+                df = pd.read_csv(io.BytesIO(contents), encoding='utf-8')
+            except UnicodeDecodeError:
+                logging.warning("UTF-8 failed, trying ISO-8859-1.")
+                df = pd.read_csv(io.BytesIO(contents), encoding='ISO-8859-1')
+            except Exception as e:
+                logging.error(f"CSV read failed: {e}")
+                raise HTTPException(status_code=400, detail=f"Could not read CSV file: {e}")
+
+        elif filename.endswith((".xlsx", ".xls")):
+            df = pd.read_excel(io.BytesIO(contents), header=0)
+            
+        else:
+            raise HTTPException(status_code=400, detail="Unsupported file type. Please upload .csv, .xlsx, or .xls.")
+            
+        if df.empty:
+            raise HTTPException(status_code=400, detail="Uploaded file is empty or could not be parsed.")
+            
+    except HTTPException:
+        raise # Re-raise known HTTP exceptions
+    except Exception as e:
+        logging.error(f"File processing error: {e}")
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred during file processing: {e}")
+        
+    return analyze_dataframe(df)
+
+
+@app.get("/")
+def root():
+    return {"message": "Advanced Data Analyzer backend is running! Use /analyze to upload a file."}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import React, { useState, useEffect } from "react";
+import axios from "axios";
+import Plot from "react-plotly.js";
+
+// NOTE: This URL assumes a local FastAPI or similar server is running on port 8000.
+// You must ensure your backend server is running and accessible at this address.
+const BACKEND_URL = "http://localhost:8000/analyze";
+
+export default function App() {
+  const [file, setFile] = useState(null);
+  const [analysis, setAnalysis] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+  const [darkMode, setDarkMode] = useState(false);
+  // State to manage the active view: 'input', 'visualizations', or 'analysis'
+  const [view, setView] = useState('input'); 
+  // State to track the currently displayed chart index for the single-chart view
+  const [currentChartIndex, setCurrentChartIndex] = useState(0); 
+
+  // Theme object for managing styling across light/dark modes
+  const theme = {
+    background: darkMode ? "#0f172a" : "#f5f7fa",
+    cardBg: darkMode ? "#1e293b" : "#fff",
+    text: darkMode ? "#f8fafc" : "#1f3d7a",
+    subtext: darkMode ? "#94a3b8" : "#6c7a89",
+    border: darkMode ? "#334155" : "#e5e7eb",
+    inputBg: darkMode ? "#1e293b" : "#f8f9fa",
+    primary: darkMode ? "#38bdf8" : "#1f78c1"
+  };
+
+  // Handler for uploading the file and triggering analysis
+  const upload = async () => {
+    if (!file) {
+      setError("Please select a file first.");
+      return;
+    }
+
+    const fd = new FormData();
+    fd.append("file", file);
+    
+    setLoading(true);
+    setError(null);
+    setAnalysis(null);
+    setCurrentChartIndex(0); // Reset chart index on new upload
+    
+    // Switch to the Analysis tab while the file is processing
+    setView('analysis'); 
+
+    try {
+      const res = await axios.post(BACKEND_URL, fd, {
+        headers: { "Content-Type": "multipart/form-data" },
+      });
+      
+      setAnalysis(res.data);
+      // After success, switch to the Visualizations tab
+      setView('visualizations'); 
+    } catch (err) {
+      const detail = err?.response?.data?.detail || err.message || "An unknown error occurred during analysis.";
+      setError(`Backend Error: ${detail}. Please ensure the server is running at ${BACKEND_URL}.`);
+      setView('input'); // Switch back to input on error
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Effect to reset chart index whenever new analysis results are loaded
+  useEffect(() => {
+    if (analysis && analysis.figures.length > 0) {
+        setCurrentChartIndex(0);
+    }
+  }, [analysis]);
+  
+  // Navigation Handlers
+  const handleNext = () => {
+    if (analysis && analysis.figures.length > 0) {
+        setCurrentChartIndex(prev => (prev + 1) % analysis.figures.length);
+    }
+  };
+
+  const handlePrev = () => {
+    if (analysis && analysis.figures.length > 0) {
+        // Use modulo to wrap around to the last index if current is 0
+        setCurrentChartIndex(prev => (prev - 1 + analysis.figures.length) % analysis.figures.length);
+    }
+  };
+
+
+  // Effect to set global body styles based on the theme
+  useEffect(() => {
+    document.body.style.backgroundColor = theme.background;
+    document.body.style.fontFamily =
+      "'Inter', 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif";
+    document.body.style.color = theme.text;
+  }, [darkMode, theme.background, theme.text]);
+
+  // Reusable component for section cards
+  const Card = ({ title, children, style = {} }) => (
+    <div
+      style={{
+        background: theme.cardBg,
+        padding: "25px",
+        borderRadius: "14px",
+        boxShadow: darkMode
+          ? "0 0 15px rgba(0,0,0,0.4)"
+          : "0 8px 24px rgba(0, 0, 0, 0.05)",
+        marginBottom: "30px",
+        transition: "all 0.3s ease",
+        border: `1px solid ${theme.border}`,
+        ...style
+      }}
+    >
+      <h3
+        style={{
+          borderBottom: `2px solid ${theme.primary}`,
+          paddingBottom: "10px",
+          marginBottom: "20px",
+          color: theme.text,
+          fontSize: "1.5em",
+          fontWeight: 600,
+        }}
+      >
+        {title}
+      </h3>
+      {children}
+    </div>
+  );
+
+  // Reusable component for error messages
+  const Alert = ({ children }) => (
+    <div
+      style={{
+        backgroundColor: darkMode ? "#440e0e" : "#fdecea",
+        color: darkMode ? "#fff" : "#c0392b",
+        padding: "12px",
+        borderRadius: "6px",
+        marginTop: "15px",
+        fontWeight: 500,
+      }}
+    >
+      {children}
+    </div>
+  );
+
+  // Reusable component for the data table
+  const StyledTable = ({ children }) => (
+    <table
+      style={{
+        width: "100%",
+        borderCollapse: "collapse",
+        fontSize: "0.95em",
+        color: theme.text,
+      }}
+    >
+      {children}
+    </table>
+  );
+
+  // Reusable component for table headers
+  const StyledTh = ({ children, isLetterRow = false, style = {} }) => (
+    <th
+      style={{
+        backgroundColor: isLetterRow ? (darkMode ? '#0f172a' : '#e2e8f0') : (darkMode ? "#1e293b" : "#f1f5fa"),
+        padding: "12px 15px",
+        textAlign: "left",
+        color: isLetterRow ? theme.subtext : theme.text,
+        borderBottom: isLetterRow ? 'none' : `1px solid ${theme.border}`,
+        position: 'sticky', // Make header row sticky for scrolling
+        top: isLetterRow ? 0 : '38px',
+        zIndex: 10,
+        ...style,
+      }}
+    >
+      {children}
+    </th>
+  );
+
+  // Reusable component for table data cells
+  const StyledTd = ({ children, style = {} }) => (
+    <td
+      style={{
+        padding: "10px 15px",
+        textAlign: "left",
+        borderBottom: `1px solid ${theme.border}`,
+        backgroundColor: theme.cardBg, 
+        ...style,
+      }}
+    >
+      {children}
+    </td>
+  );
+  
+  // Component for displaying raw data sample, mimicking a spreadsheet view
+  const RawDataView = ({ data, columns }) => {
+    if (!data || data.length === 0) return <p style={{ color: theme.subtext, padding: '20px' }}>No data sample available. Upload a file to see a preview here.</p>;
+
+    const maxColumns = 10; // Limit columns for visual display
+    const displayColumns = columns.slice(0, maxColumns);
+    const hasMoreColumns = columns.length > maxColumns;
+    
+    // Generate headers with letters (A, B, C...)
+    const tableHeaders = displayColumns.map((col, index) => ({
+      letter: String.fromCharCode(65 + index), 
+      name: col 
+    }));
+
+    return (
+      <div 
+        style={{ 
+          overflow: "auto", 
+          maxHeight: '70vh', 
+          background: theme.cardBg, 
+          borderRadius: '6px',
+          border: `1px solid ${theme.border}`,
+          boxShadow: darkMode ? "inset 0 0 10px rgba(0,0,0,0.2)" : "inset 0 0 10px rgba(0,0,0,0.05)"
+        }}
+      >
+        <StyledTable>
+          <thead style={{ position: 'sticky', top: 0, zIndex: 11 }}>
+            {/* Row 1: Column Letters (A, B, C...) - Sticky */}
+            <tr style={{ position: 'sticky', top: 0, zIndex: 11 }}>
+              <StyledTh isLetterRow={true} style={{ minWidth: '60px', left: 0, position: 'sticky' }}>#</StyledTh> 
+              {tableHeaders.map((header) => (
+                <StyledTh key={`letter-${header.letter}`} isLetterRow={true} style={{ fontSize: '0.8em', fontWeight: 500 }}>
+                  {header.letter}
+                </StyledTh>
+              ))}
+              {hasMoreColumns && <StyledTh isLetterRow={true} style={{ fontSize: '0.8em', fontWeight: 500 }}>...</StyledTh>}
+            </tr>
+            {/* Row 2: Column Names - Sticky */}
+            <tr style={{ position: 'sticky', top: '38px', zIndex: 11 }}>
+              <StyledTh style={{ fontWeight: 600, minWidth: '60px', left: 0, position: 'sticky', backgroundColor: darkMode ? "#1e293b" : "#f1f5fa" }}>Row ID</StyledTh>
+              {tableHeaders.map((header) => (
+                <StyledTh key={`name-${header.name}`} style={{ fontWeight: 600, minWidth: '120px' }}>
+                  {header.name}
+                </StyledTh>
+              ))}
+              {hasMoreColumns && <StyledTh style={{ fontWeight: 600, minWidth: '50px' }}>+{columns.length - maxColumns} more</StyledTh>}
+            </tr>
+          </thead>
+          <tbody>
+            {/* Display data rows */}
+            {data.map((row, rowIndex) => (
+                <tr key={rowIndex}>
+                    <StyledTd style={{ fontWeight: 600, left: 0, position: 'sticky', backgroundColor: theme.cardBg }}>{rowIndex + 1}</StyledTd>
+                    {displayColumns.map((colName, colIndex) => (
+                        <StyledTd key={`${rowIndex}-${colIndex}`}>
+                            {row[colName] !== null && row[colName] !== undefined ? String(row[colName]) : <span style={{ color: theme.subtext, opacity: 0.6 }}>--</span>}
+                        </StyledTd>
+                    ))}
+                    {hasMoreColumns && <StyledTd>...</StyledTd>}
+                </tr>
+            ))}
+          </tbody>
+        </StyledTable>
+      </div>
+    );
+  };
+
+  return (
+    <div
+      style={{
+        padding: 30,
+        maxWidth: 1400,
+        margin: "0 auto",
+        minHeight: "100vh",
+      }}
+    >
+      <header
+        style={{
+          textAlign: "center",
+          marginBottom: "40px",
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+          flexWrap: "wrap",
+        }}
+      >
+        <h1
+          style={{
+            color: theme.text,
+            fontSize: "2.8em",
+            fontWeight: 700,
+            margin: 0,
+          }}
+        >
+            Dataverse AI
+        </h1>
+        <button
+          onClick={() => setDarkMode((prev) => !prev)}
+          style={{
+            padding: "10px 16px",
+            background: darkMode ? "#334155" : theme.primary,
+            color: "#fff",
+            border: "none",
+            borderRadius: "6px",
+            cursor: "pointer",
+            fontWeight: 500,
+            transition: "background-color 0.3s ease",
+          }}
+        >
+          {darkMode ? "☀️ Light Mode" : "🌙 Dark Mode"}
+        </button>
+      </header>
+
+      {/* Main Tabbed Interface */}
+      <div style={{ padding: "20px", borderRadius: "14px", background: theme.cardBg, border: `1px solid ${theme.border}`, boxShadow: darkMode ? "0 0 15px rgba(0,0,0,0.4)" : "0 8px 24px rgba(0, 0, 0, 0.05)", }}>
+        <div style={{ display: 'flex', borderBottom: `2px solid ${theme.border}`, marginBottom: '20px' }}>
+            {/* Tab 1: Input Data */}
+            <button
+                onClick={() => setView('input')}
+                style={{
+                    padding: "10px 20px",
+                    cursor: "pointer",
+                    fontWeight: 600,
+                    border: 'none',
+                    borderBottom: view === 'input' ? `3px solid ${theme.primary}` : '3px solid transparent',
+                    background: 'none',
+                    color: view === 'input' ? theme.text : theme.subtext,
+                    transition: 'color 0.3s',
+                }}
+            >
+                Input Data
+            </button>
+
+            {/* Tab 2: Analysis (Report) */}
+            <button
+                onClick={() => setView('analysis')}
+                disabled={!analysis && !loading} 
+                style={{
+                    padding: "10px 20px",
+                    cursor: (analysis || loading) ? "pointer" : "not-allowed",
+                    fontWeight: 600,
+                    border: 'none',
+                    borderBottom: view === 'analysis' ? `3px solid ${theme.primary}` : '3px solid transparent',
+                    background: 'none',
+                    color: view === 'analysis' ? theme.text : theme.subtext,
+                    transition: 'color 0.3s',
+                    opacity: (analysis || loading) ? 1 : 0.5,
+                }}
+            >
+                Analysis (Report)
+            </button>
+            
+            {/* Tab 3: Visualizations */}
+            <button
+                onClick={() => setView('visualizations')}
+                disabled={!analysis && !loading} 
+                style={{
+                    padding: "10px 20px",
+                    cursor: (analysis || loading) ? "pointer" : "not-allowed",
+                    fontWeight: 600,
+                    border: 'none',
+                    borderBottom: view === 'visualizations' ? `3px solid ${theme.primary}` : '3px solid transparent',
+                    background: 'none',
+                    color: view === 'visualizations' ? theme.text : theme.subtext,
+                    transition: 'color 0.3s',
+                    opacity: (analysis || loading) ? 1 : 0.5,
+                }}
+            >
+                Visualizations
+            </button>
+        </div>
+        
+        {/* === LOADING STATE FOR ALL ANALYSIS/VISUALIZATION VIEWS === */}
+        {(view === 'analysis' || view === 'visualizations') && loading && (
+            <p style={{ color: theme.subtext, padding: '50px', textAlign: 'center', fontSize: '1.1em' }}>
+              <span role="img" aria-label="loading" style={{fontSize: '2em', display: 'block', marginBottom: '10px'}}>⚙️</span>
+              Processing file and generating report. This may take a moment...
+            </p>
+        )}
+        
+        {/* === FALLBACK IF NOT ANALYZED === */}
+        {(view === 'analysis' || view === 'visualizations') && !analysis && !loading && (
+            <p style={{ color: theme.subtext, padding: '20px', textAlign: 'center' }}>Upload a file in the **Input Data** tab and click 'Upload & Analyze' to view the analysis.</p>
+        )}
+
+        {/* === INPUT DATA VIEW CONTENT === */}
+        {view === 'input' && (
+            <>
+                <div style={{ display: "flex", gap: "20px", alignItems: "center", flexWrap: 'wrap', marginBottom: '20px' }}>
+                    <input
+                        type="file"
+                        accept=".xlsx,.xls,.csv"
+                        onChange={(e) => {
+                            setFile(e.target.files[0]);
+                            setAnalysis(null);
+                            setError(null);
+                        }}
+                        style={{
+                            padding: "10px",
+                            border: `1px solid ${theme.border}`,
+                            borderRadius: "6px",
+                            background: theme.inputBg,
+                            color: theme.text,
+                            flexGrow: 1,
+                            minWidth: '200px'
+                        }}
+                    />
+                    <button
+                        onClick={upload}
+                        disabled={loading || !file}
+                        style={{
+                            padding: "10px 20px",
+                            backgroundColor: theme.primary,
+                            color: "#fff",
+                            border: "none",
+                            borderRadius: "6px",
+                            cursor: loading || !file ? "not-allowed" : "pointer",
+                            fontWeight: 500,
+                            opacity: loading || !file ? 0.7 : 1,
+                            transition: "opacity 0.3s ease, background-color 0.3s ease",
+                        }}
+                    >
+                        {loading ? "Analyzing..." : "Upload & Analyze"}
+                    </button>
+                </div>
+                {error && <Alert>{error}</Alert>}
+                
+                {/* Display the raw data sample after a successful analysis */}
+                <h2 style={{ fontSize: '1.4em', fontWeight: 600, color: theme.text, marginTop: '20px', marginBottom: '10px' }}>
+                    {analysis ? `Previewing Data Sample (${analysis.column_names.length} columns, showing first 50 rows)` : "Data Preview (Upload a file to see a sample)"}
+                </h2>
+                {analysis && analysis.raw_data_sample ? (
+                    <RawDataView 
+                        data={analysis.raw_data_sample} 
+                        columns={analysis.column_names} 
+                    />
+                ) : (
+                    <div style={{ padding: '20px', border: `1px solid ${theme.border}`, borderRadius: '6px', backgroundColor: theme.inputBg }}>
+                        <p style={{ color: theme.subtext, textAlign: 'center' }}>
+                            {file ? `File selected: ${file.name}. Click 'Upload & Analyze' to process and see the preview.` : "No file uploaded yet. Only .xlsx, .xls, and .csv files are supported."}
+                        </p>
+                    </div>
+                )}
+            </>
+        )}
+        
+        {/* --- VISUALIZATIONS VIEW CONTENT (Single Chart + Navigation) --- */}
+        {view === 'visualizations' && analysis && (
+            <>
+                {analysis.figures.length > 0 ? (
+                    <Card 
+                        title={`Visualizations (${currentChartIndex + 1} of ${analysis.figures.length})`} 
+                        style={{ marginBottom: 0 }}
+                    >
+                        {/* Container for the single chart and navigation buttons */}
+                        <div 
+                            style={{ 
+                                display: 'flex', 
+                                alignItems: 'center', 
+                                justifyContent: 'center', 
+                                position: 'relative',
+                                minHeight: '550px', // Ensure min height for better layout
+                                background: theme.cardBg, // Chart container background
+                                borderRadius: '8px',
+                                border: `1px solid ${theme.border}`,
+                            }}
+                        >
+                            {/* Previous Button */}
+                            <button
+                                onClick={handlePrev}
+                                disabled={analysis.figures.length <= 1}
+                                style={{
+                                    position: 'absolute',
+                                    left: '10px',
+                                    top: '50%',
+                                    transform: 'translateY(-50%)',
+                                    zIndex: 20,
+                                    padding: '15px 5px',
+                                    borderRadius: '50%',
+                                    background: 'rgba(0,0,0,0.6)',
+                                    color: 'white',
+                                    border: 'none',
+                                    cursor: analysis.figures.length <= 1 ? 'not-allowed' : 'pointer',
+                                    opacity: analysis.figures.length <= 1 ? 0.3 : 1,
+                                    fontSize: '24px',
+                                    lineHeight: 0,
+                                    transition: 'background 0.2s',
+                                    boxShadow: '0 2px 5px rgba(0,0,0,0.3)'
+                                }}
+                            >
+                                &#9664; {/* Left arrow */}
+                            </button>
+
+                            {/* Current Plot Rendering */}
+                            {analysis.figures[currentChartIndex] && (
+                                <div 
+                                    key={analysis.figures[currentChartIndex].id}
+                                    style={{
+                                        width: "90%", // Limit plot width slightly to make room for arrows
+                                        maxWidth: 800, 
+                                        height: 'auto',
+                                        transition: 'opacity 0.3s ease',
+                                    }}
+                                >
+                                    <Plot
+                                        data={analysis.figures[currentChartIndex].figure.data || []}
+                                        layout={{
+                                            ...analysis.figures[currentChartIndex].figure.layout,
+                                            autosize: true,
+                                            paper_bgcolor: theme.cardBg,
+                                            plot_bgcolor: theme.cardBg,
+                                            font: { color: theme.text },
+                                            margin: { t: 50, b: 50, l: 50, r: 20 },
+                                        }}
+                                        config={{ 
+                                            ...analysis.figures[currentChartIndex].figure.config,
+                                            responsive: true 
+                                        }}
+                                        style={{
+                                            width: "100%",
+                                            // Adjust height based on plot type, or use a default
+                                            height: analysis.figures[currentChartIndex].id === "heatmap_corr" ? 550 : 450, 
+                                        }}
+                                    />
+                                </div>
+                            )}
+                            
+                            {/* Next Button */}
+                            <button
+                                onClick={handleNext}
+                                disabled={analysis.figures.length <= 1}
+                                style={{
+                                    position: 'absolute',
+                                    right: '10px',
+                                    top: '50%',
+                                    transform: 'translateY(-50%)',
+                                    zIndex: 20,
+                                    padding: '15px 5px',
+                                    borderRadius: '50%',
+                                    background: 'rgba(0,0,0,0.6)',
+                                    color: 'white',
+                                    border: 'none',
+                                    cursor: analysis.figures.length <= 1 ? 'not-allowed' : 'pointer',
+                                    opacity: analysis.figures.length <= 1 ? 0.3 : 1,
+                                    fontSize: '24px',
+                                    lineHeight: 0,
+                                    transition: 'background 0.2s',
+                                    boxShadow: '0 2px 5px rgba(0,0,0,0.3)'
+                                }}
+                            >
+                                &#9654; {/* Right arrow */}
+                            </button>
+                        </div>
+                        
+                    </Card>
+                ) : (
+                    <p style={{ color: theme.subtext, padding: '20px', textAlign: 'center' }}>No visualizations could be generated, likely due to insufficient numeric or categorical data.</p>
+                )}
+            </>
+        )}
+
+
+        {/* === ANALYSIS (REPORT) VIEW CONTENT === */}
+        {view === 'analysis' && analysis && (
+            <>
+              {/* 1. Dataset Overview Table (Full Width) */}
+              <Card title="1. Dataset Overview">
+                <p style={{ fontWeight: 500, color: theme.text, marginBottom: '15px' }}>
+                  Dataset has <strong>{analysis.meta.rows}</strong> rows and{" "}
+                  <strong>{analysis.meta.cols}</strong> columns.
+                </p>
+                <div style={{ overflowX: "auto" }}>
+                  <StyledTable>
+                    <thead>
+                      <tr>
+                        <StyledTh style={{position: 'relative', top: 'unset'}}>Name</StyledTh>
+                        <StyledTh style={{position: 'relative', top: 'unset'}}>Dtype</StyledTh>
+                        <StyledTh style={{position: 'relative', top: 'unset'}}>Missing (%)</StyledTh>
+                        <StyledTh style={{position: 'relative', top: 'unset'}}>Unique Values</StyledTh>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {analysis.meta.columns.map((col, i) => {
+                        const missingPercent = ((col.missing / analysis.meta.rows) * 100);
+                        return (
+                          <tr key={i}>
+                            <StyledTd>{col.name}</StyledTd>
+                            <StyledTd>{col.dtype}</StyledTd>
+                            <StyledTd 
+                              style={{
+                                // Highlight columns with high missing percentages
+                                backgroundColor: missingPercent > 50 
+                                  ? (darkMode ? '#440e0e' : '#ffeeee') 
+                                  : theme.cardBg,
+                                color: missingPercent > 50 
+                                  ? (darkMode ? '#fef2f2' : '#c0392b') 
+                                  : theme.text,
+                                fontWeight: missingPercent > 0 ? 600 : 500
+                              }}
+                            >
+                              {missingPercent.toFixed(1)}%
+                            </StyledTd>
+                            <StyledTd>{col.unique}</StyledTd>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </StyledTable>
+                </div>
+              </Card>
+
+              {/* 2. AI-Powered Analysis Summary (Full Width) */}
+              <Card title="2. AI-Powered Analysis Summary" style={{ marginBottom: 0 }}>
+                  <div style={{ color: theme.text, lineHeight: 1.8, whiteSpace: 'pre-wrap' }} dangerouslySetInnerHTML={{ __html: analysis.nlg_summary.replace(/\*\*/g, '<strong>').replace(/\n/g, '<br/>') }} />
+                  <p style={{ fontSize: '0.9em', color: theme.subtext, marginTop: '20px' }}>
+                      *This summary is generated by a large language model based on the statistical report above and may not reflect all nuances of the data.
+                  </p>
+              </Card>
+            </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+
+main
+'''
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+import pandas as pd
+import io
+import numpy as np
+from sklearn.ensemble import IsolationForest
+import os
+import json
+import logging
+
+# Set up logging for better error visibility
+logging.basicConfig(level=logging.INFO)
+
+# Optional: OpenAI client for NLG summary
+client = None
+if os.environ.get("OPENAI_API_KEY"):
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+        logging.info("OpenAI client initialized for NLG summaries.")
+    except ImportError:
+        logging.warning("Warning: 'openai' library not installed. AI summary will be unavailable.")
+    except Exception as e:
+        logging.warning(f"Error initializing OpenAI client: {e}. AI summary will be unavailable.")
+else:
+    logging.info("OPENAI_API_KEY not found. AI summary will be unavailable.")
+
+
+app = FastAPI()
+
+# Enable CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+MAX_ROWS = 200000
+
+# ✅ Common Plotly config (used for all charts)
+PLOTLY_CONFIG = {
+    "displayModeBar": True,
+    "displaylogo": False,
+    "responsive": True,
+    "toImageButtonOptions": {
+        "format": "png",
+        "filename": "plot_download",
+        "height": 600,
+        "width": 800,
+        "scale": 2
+    }
+}
+
+
+def sanitize(obj):
+    """Recursively cleans numpy types and NaN values from dictionaries/lists for JSON serialization."""
+    if isinstance(obj, dict):
+        return {k: sanitize(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [sanitize(elem) for elem in obj]
+    elif isinstance(obj, (np.integer, int)):
+        return int(obj)
+    elif isinstance(obj, (np.floating, float)):
+        if np.isnan(obj) or np.isinf(obj):
+            return None
+        return float(obj)
+    elif isinstance(obj, (np.bool_, bool)):
+        return bool(obj)
+    elif pd.isna(obj):
+        return None
+    else:
+        return obj
+
+
+def feature_engineer(df: pd.DataFrame):
+    """
+    Performs basic feature engineering for date-like and long-text columns.
+    This helps in providing more features for the anomaly detection model.
+    """
+    # 1. Date Feature Engineering
+    date_like_cols = [
+        col for col in df.columns 
+        if df[col].dtype == 'object' and df[col].nunique() > 1 and df[col].nunique() < df.shape[0] * 0.9
+    ]
+
+    for col in date_like_cols:
+        try:
+            # Attempt to parse to datetime
+            dt_series = pd.to_datetime(df[col], errors='coerce')
+            # Only proceed if more than 50% of values are valid dates
+            if dt_series.notna().sum() / df.shape[0] > 0.5:
+                df[f'{col}_Month'] = dt_series.dt.month.astype('category')
+                df[f'{col}_DayOfWeek'] = dt_series.dt.day_name().astype('category')
+                df[f'{col}_IsWeekend'] = dt_series.dt.weekday >= 5
+        except Exception as e:
+            logging.debug(f"Date feature engineering failed for {col}: {e}")
+            pass
+
+    # 2. Text Feature Engineering (Length)
+    object_cols = df.select_dtypes(include=['object']).columns
+    for col in object_cols:
+        # Check if the column is high cardinality and has potentially meaningful text content
+        if df[col].nunique() > 50 and df.shape[0] > 100:
+            df[f'{col}_Length'] = df[col].astype(str).apply(len)
+
+    return df
+
+
+def detect_outliers(df: pd.DataFrame):
+    """Detects outliers using Isolation Forest on all numeric features."""
+    # Select only numeric columns that have at least some variance
+    numeric_cols = df.select_dtypes(include=np.number).columns
+    valid_numeric_cols = [
+        col for col in numeric_cols 
+        if df[col].nunique() > 1 and df[col].count() > 0
+    ]
+    
+    outliers = []
+
+    if len(valid_numeric_cols) >= 2 and df.shape[0] > 50:
+        # Impute NaNs with median for anomaly detection consistency
+        X = df[valid_numeric_cols].fillna(df[valid_numeric_cols].median())
+        
+        try:
+            model = IsolationForest(contamination='auto', random_state=42, n_jobs=-1)
+            model.fit(X)
+            is_outlier = model.predict(X)
+            outlier_indices = X[is_outlier == -1].index.tolist()
+            if outlier_indices:
+                outliers = [int(i) for i in outlier_indices]
+        except Exception as e:
+            logging.error(f"Isolation Forest failed: {e}")
+
+    return outliers
+
+
+def generate_nlg_summary(meta, summary, corr_pairs, outliers):
+    """Generates a cognitive summary using the OpenAI API (or Gemini API if configured)."""
+    if not client:
+        return "NLG Summary service is unavailable. Ensure the 'openai' library is installed and OPENAI_API_KEY is set."
+
+    # Subsetting the descriptive statistics for a cleaner prompt
+    key_stats = {}
+    for col, stats in summary.items():
+        if isinstance(stats, dict) and 'mean' in stats:
+            key_stats[col] = {
+                'mean': stats.get('mean', 'N/A'),
+                'std': stats.get('std', 'N/A'),
+                'min': stats.get('min', 'N/A'),
+                'max': stats.get('max', 'N/A'),
+                'unique': stats.get('unique', 'N/A'),
+                'dtype': next((c['dtype'] for c in meta['columns'] if c['name'] == col), 'unknown')
+            }
+
+    stats_json = json.dumps(key_stats, indent=2, default=str)[:3000]
+
+    corr_report = "\n".join([
+        f"- {p['x']} vs {p['y']}: {p['corr']:.3f}" for p in corr_pairs
+    ])
+
+    prompt = f"""
+    You are a helpful, senior data scientist. Analyze the provided dataset metadata, key statistics, and anomaly report.
+    The goal is to provide a quick, professional assessment for a data team.
+
+    1. Provide a **Cognitive Summary** (about 3 sentences) of the dataset's overall shape, focusing on key features (e.g., scale, balance, notable high/low variance columns).
+    2. Provide 2-3 **Actionable Recommendations** (e.g., handling missing data in a specific column, cleaning outliers, or potential modeling ideas based on correlations).
+    3. Format the response clearly using markdown. Use bold markdown (**text**) for key points.
+
+    ---
+    ### Dataset Metadata
+    Rows: {meta['rows']:,}
+    Columns: {meta['cols']}
+    Engineered Features Added: {sum(1 for c in meta['columns'] if c['is_engineered'])}
+
+    ### Top Correlations (Absolute Value)
+    {corr_report if corr_report else 'No strong correlations (|\rho| > 0.7) found.'}
+
+    ### Anomaly Report
+    Outliers Detected (IsolationForest): {len(outliers)} rows
+
+    ### Key Column Statistics Sample
+    {stats_json}
+    """
+
+    try:
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "You are a concise, analytical data science assistant who provides professional summaries and recommendations."},
+                {"role": "user", "content": prompt}
+            ]
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        logging.error(f"NLG Summary generation failed: {e}")
+        return f"NLG Summary unavailable due to API error: {e}"
+
+
+def analyze_dataframe(df: pd.DataFrame):
+    """Main data analysis workflow."""
+    # Drop rows/columns that are entirely NaN
+    df = df.dropna(how='all', axis=0).dropna(how='all', axis=1)
+    
+    # Store initial column names before engineering
+    original_column_names = df.columns.tolist()
+
+    df = feature_engineer(df)
+
+    # Limit to MAX_ROWS if the dataset is too large, but run analysis on the head
+    if df.shape[0] > MAX_ROWS:
+        logging.warning(f"Dataset truncated to {MAX_ROWS} rows for analysis.")
+        df = df.head(MAX_ROWS).copy()
+
+    # --- Metadata Calculation ---
+    meta = {
+        "rows": int(df.shape[0]),
+        "cols": int(df.shape[1]),
+        "columns": [
+            {
+                "name": str(col),
+                "dtype": str(df[col].dtype),
+                "missing": int(df[col].isna().sum()),
+                "unique": int(df[col].nunique(dropna=True)),
+                "is_engineered": any(x in str(col) for x in ['Month', 'DayOfWeek', 'Length', 'IsWeekend'])
+            }
+            for col in df.columns
+        ]
+    }
+
+    # --- Summary Statistics ---
+    summary = sanitize(df.describe(include="all").to_dict())
+    
+    # --- Correlation & Plot Generation ---
+    corr_pairs = []
+    figures = []
+    numeric_cols = df.select_dtypes(include=np.number)
+    numeric_cols_names = numeric_cols.columns.tolist()
+    categorical_cols_names = df.select_dtypes(include=['object', 'category']).columns.tolist()
+
+    # 1. Correlation Heatmap
+    if len(numeric_cols.columns) >= 2:
+        corr_matrix = numeric_cols.corr()
+        heatmap_fig = {
+            "id": "heatmap_corr",
+            "figure": {
+                "data": [{
+                    "z": corr_matrix.values.tolist(),
+                    "x": corr_matrix.columns.tolist(),
+                    "y": corr_matrix.columns.tolist(),
+                    "type": "heatmap",
+                    "colorscale": "Plasma", # Changed to Plasma for visibility
+                    "hovertemplate": "Correlation(%{x}, %{y}): %{z:.2f}<extra></extra>",
+                }],
+                "layout": {"title": {"text": "Correlation Heatmap"}, "height": 550, "width": 650},
+                "config": PLOTLY_CONFIG
+            }
+        }
+        figures.append(heatmap_fig)
+
+        # Top correlations extraction
+        corr_abs_matrix = corr_matrix.abs()
+        already_seen = set()
+        for i in corr_abs_matrix.columns:
+            for j in corr_abs_matrix.columns:
+                if i != j and (j, i) not in already_seen and abs(corr_matrix.loc[i, j]) >= 0.7:
+                    actual_corr = corr_matrix.loc[i, j]
+                    corr_pairs.append({"x": i, "y": j, "corr": float(actual_corr)})
+                    already_seen.add((i, j))
+        # Sort by absolute correlation and take top 10
+        corr_pairs = sorted(corr_pairs, key=lambda x: abs(x["corr"]), reverse=True)[:10]
+
+        # 2. Scatter plots for top correlated pairs
+        for pair in corr_pairs[:5]:
+            col_x, col_y = pair['x'], pair['y']
+            plot_df = df[[col_x, col_y]].dropna()
+            fig = {
+                "id": f"scatter_{col_x}_vs_{col_y}",
+                "figure": {
+                    "data": [{
+                        "x": plot_df[col_x].tolist(),
+                        "y": plot_df[col_y].tolist(),
+                        "mode": "markers",
+                        "type": "scatter",
+                        "marker": {"color": "#1f77b4", "size": 6}, # Default Plotly blue
+                        "name": f"{col_x} vs {col_y}",
+                        "hovertemplate": f"{col_x}: %{{x}}<br>{col_y}: %{{y}}<extra></extra>"
+                    }],
+                    "layout": {"title": {"text": f"Scatter Plot: {col_x} vs {col_y}"}, "height": 450},
+                    "config": PLOTLY_CONFIG
+                }
+            }
+            figures.append(fig)
+
+    # 3. Box plot (Numeric vs Low-Cardinality Category)
+    if numeric_cols_names and categorical_cols_names:
+        num_col = numeric_cols_names[0]
+        # Find a suitable categorical column (2 to 10 unique values)
+        cat_col = next((col for col in categorical_cols_names if 2 <= df[col].nunique() <= 10), None)
+        if cat_col:
+            fig = {
+                "id": f"boxplot_{num_col}_by_{cat_col}",
+                "figure": {
+                    "data": [{
+                        "y": df[num_col].tolist(),
+                        "x": df[cat_col].astype(str).tolist(),
+                        "type": "box",
+                        "boxpoints": 'outliers',
+                        "marker": {"color": "darkgreen"},
+                        "name": f"{num_col} by {cat_col}"
+                    }],
+                    "layout": {"title": {"text": f"Box Plot: {num_col} by {cat_col}"}, "height": 450},
+                    "config": PLOTLY_CONFIG
+                }
+            }
+            figures.append(fig)
+
+    # 4. Histograms (Numeric Distributions)
+    for col in numeric_cols_names:
+        fig = {
+            "id": f"hist_{col}",
+            "figure": {
+                "data": [{
+                    "x": numeric_cols[col].dropna().tolist(),
+                    "type": "histogram",
+                    "marker": {"color": "lightblue"},
+                    "nbinsx": 50 # Increase bin count for better detail
+                }],
+                "layout": {"title": {"text": f"Distribution of {col}"}, "height": 400},
+                "config": PLOTLY_CONFIG
+            }
+        }
+        figures.append(fig)
+
+    # 5. Bar charts (Categorical Counts)
+    categorical_cols = df.select_dtypes(include=['object', 'category', 'bool'])
+    for col in categorical_cols.columns:
+        top_counts = df[col].value_counts(dropna=True).head(10)
+        if not top_counts.empty and top_counts.shape[0] > 1:
+            fig = {
+                "id": f"bar_{col}",
+                "figure": {
+                    "data": [{
+                        "x": top_counts.index.astype(str).tolist(),
+                        "y": top_counts.values.tolist(),
+                        "type": "bar",
+                        "marker": {"color": "teal"}
+                    }],
+                    "layout": {"title": {"text": f"Top 10 Counts of {col}"}, "height": 450},
+                    "config": PLOTLY_CONFIG
+                }
+            }
+            figures.append(fig)
+            
+    # --- Anomaly Detection and NLG ---
+    outliers = detect_outliers(df)
+    nlg_summary = generate_nlg_summary(meta, summary, corr_pairs, outliers)
+    raw_data_sample = sanitize(df[original_column_names].head(50).to_dict('records'))
+
+
+    return {
+        "meta": meta,
+        "summary": summary,
+        "corr_pairs": corr_pairs,
+        "figures": figures,
+        "outliers": outliers,
+        "nlg_summary": nlg_summary,
+        "raw_data_sample": raw_data_sample,
+        "column_names": original_column_names # Return original names for display
+    }
+
+
+@app.post("/analyze")
+async def analyze(file: UploadFile = File(...)):
+    """API endpoint to upload and analyze a data file."""
+    filename = file.filename.lower()
+    contents = await file.read()
+    df = pd.DataFrame()
+    
+    try:
+        if filename.endswith(".csv"):
+            # Attempt to read CSV with common encodings for robustness
+            try:
+                df = pd.read_csv(io.BytesIO(contents), encoding='utf-8')
+            except UnicodeDecodeError:
+                logging.warning("UTF-8 failed, trying ISO-8859-1.")
+                df = pd.read_csv(io.BytesIO(contents), encoding='ISO-8859-1')
+            except Exception as e:
+                logging.error(f"CSV read failed: {e}")
+                raise HTTPException(status_code=400, detail=f"Could not read CSV file: {e}")
+
+        elif filename.endswith((".xlsx", ".xls")):
+            df = pd.read_excel(io.BytesIO(contents), header=0)
+            
+        else:
+            raise HTTPException(status_code=400, detail="Unsupported file type. Please upload .csv, .xlsx, or .xls.")
+            
+        if df.empty:
+            raise HTTPException(status_code=400, detail="Uploaded file is empty or could not be parsed.")
+            
+    except HTTPException:
+        raise # Re-raise known HTTP exceptions
+    except Exception as e:
+        logging.error(f"File processing error: {e}")
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred during file processing: {e}")
+        
+    return analyze_dataframe(df)
+
+
+@app.get("/")
+def root():
+    return {"message": "Advanced Data Analyzer backend is running! Use /analyze to upload a file."}
+
+
+'''
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+import pandas as pd
+import io
+import numpy as np
+from sklearn.ensemble import IsolationForest
+import logging
+
+# --------------------------------------------------------------------
+# ✅ LOGGING CONFIGURATION
+# --------------------------------------------------------------------
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+
+# --------------------------------------------------------------------
+# ✅ FASTAPI APP INITIALIZATION
+# --------------------------------------------------------------------
+app = FastAPI(title="Data Analyzer Backend", version="2.0")
+
+# Enable CORS (for frontend communication)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# --------------------------------------------------------------------
+# ✅ CONSTANTS
+# --------------------------------------------------------------------
+MAX_ROWS = 200000
+
+PLOTLY_CONFIG = {
+    "displayModeBar": True,
+    "displaylogo": False,
+    "responsive": True,
+}
+
+# --------------------------------------------------------------------
+# ✅ HELPER FUNCTIONS
+# --------------------------------------------------------------------
+def sanitize(obj):
+    """Cleans numpy and NaN values for safe JSON serialization."""
+    if isinstance(obj, dict):
+        return {k: sanitize(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [sanitize(x) for x in obj]
+    elif isinstance(obj, (np.integer, int)):
+        return int(obj)
+    elif isinstance(obj, (np.floating, float)):
+        if np.isnan(obj) or np.isinf(obj):
+            return None
+        return float(obj)
+    elif pd.isna(obj):
+        return None
+    else:
+        return obj
+
+
+def feature_engineer(df: pd.DataFrame):
+    """Adds engineered features for datetime and text columns."""
+    # Convert object columns that look like dates
+    for col in df.select_dtypes(include="object").columns:
+        try:
+            dt = pd.to_datetime(df[col], errors="coerce")
+            if dt.notna().sum() / len(dt) > 0.5:
+                df[f"{col}_Month"] = dt.dt.month
+                df[f"{col}_DayOfWeek"] = dt.dt.dayofweek
+                df[f"{col}_IsWeekend"] = dt.dt.weekday >= 5
+        except Exception:
+            continue
+
+    # Text length features
+    for col in df.select_dtypes(include="object").columns:
+        if df[col].nunique() > 50:
+            df[f"{col}_Length"] = df[col].astype(str).apply(len)
+    return df
+
+
+def detect_outliers(df: pd.DataFrame):
+    """Detects outliers using Isolation Forest on numeric data."""
+    numeric_cols = df.select_dtypes(include=np.number).columns
+    valid_cols = [c for c in numeric_cols if df[c].nunique() > 1]
+
+    if len(valid_cols) < 2:
+        return []
+
+    X = df[valid_cols].fillna(df[valid_cols].median())
+    try:
+        model = IsolationForest(contamination="auto", random_state=42)
+        preds = model.fit_predict(X)
+        return list(df.index[preds == -1])
+    except Exception as e:
+        logging.warning(f"Outlier detection failed: {e}")
+        return []
+
+
+# --------------------------------------------------------------------
+# ✅ MAIN ANALYSIS FUNCTION
+# --------------------------------------------------------------------
+def analyze_dataframe(df: pd.DataFrame):
+    """Performs automatic dataset profiling and visualization setup."""
+    df = df.dropna(how="all", axis=0).dropna(how="all", axis=1)
+    if df.empty:
+        raise HTTPException(status_code=400, detail="The uploaded dataset is empty.")
+
+    df = feature_engineer(df)
+    if df.shape[0] > MAX_ROWS:
+        df = df.head(MAX_ROWS)
+
+    # Metadata
+    meta = {
+        "rows": int(df.shape[0]),
+        "cols": int(df.shape[1]),
+        "columns": [
+            {
+                "name": str(col),
+                "dtype": str(df[col].dtype),
+                "missing": int(df[col].isna().sum()),
+                "unique": int(df[col].nunique(dropna=True)),
+            }
+            for col in df.columns
+        ],
+    }
+
+    # Summary
+    summary = sanitize(df.describe(include="all").to_dict())
+
+    # Correlation analysis
+    corr_pairs = []
+    numeric = df.select_dtypes(include=np.number)
+    if numeric.shape[1] >= 2:
+        corr = numeric.corr()
+        for i in corr.columns:
+            for j in corr.columns:
+                if i != j and abs(corr.loc[i, j]) >= 0.7:
+                    corr_pairs.append({"x": i, "y": j, "corr": float(corr.loc[i, j])})
+
+    # Visualization templates
+    figures = []
+    # Histogram
+    for col in numeric.columns:
+        figures.append({
+            "id": f"hist_{col}",
+            "figure": {
+                "data": [{"x": numeric[col].dropna().tolist(), "type": "histogram"}],
+                "layout": {"title": {"text": f"Histogram of {col}"}},
+                "config": PLOTLY_CONFIG
+            }
+        })
+
+    # Categorical bar chart
+    for col in df.select_dtypes(include=["object", "category", "bool"]).columns:
+        vc = df[col].value_counts().head(10)
+        if len(vc) > 1:
+            figures.append({
+                "id": f"bar_{col}",
+                "figure": {
+                    "data": [{"x": vc.index.tolist(), "y": vc.values.tolist(), "type": "bar"}],
+                    "layout": {"title": {"text": f"Top Categories in {col}"}},
+                    "config": PLOTLY_CONFIG
+                }
+            })
+
+    # Detect outliers
+    outliers = detect_outliers(df)
+
+    # Sample data
+    sample = sanitize(df.head(30).to_dict("records"))
+
+    return {
+        "meta": meta,
+        "summary": summary,
+        "correlations": corr_pairs,
+        "figures": figures,
+        "outliers": outliers,
+        "sample": sample,
+    }
+
+# --------------------------------------------------------------------
+# ✅ API ROUTES
+# --------------------------------------------------------------------
+@app.get("/")
+def root():
+    return {"message": "Data Analyzer backend is running successfully!"}
+
+
+@app.post("/analyze")
+async def analyze(file: UploadFile = File(...)):
+    """Accepts a CSV/XLSX file and returns analysis results."""
+    contents = await file.read()
+    try:
+        if file.filename.lower().endswith(".csv"):
+            df = pd.read_csv(io.BytesIO(contents), encoding_errors="ignore")
+        elif file.filename.lower().endswith((".xlsx", ".xls")):
+            df = pd.read_excel(io.BytesIO(contents))
+        else:
+            raise HTTPException(status_code=400, detail="Unsupported file type. Use .csv or .xlsx")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error reading file: {e}")
+
+    return analyze_dataframe(df)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import React, { useState, useEffect } from "react";
+import axios from "axios";
+import Plot from "react-plotly.js";
+
+const BACKEND_URL = "http://localhost:8000/analyze";
+const MAX_ROWS = 200000;
+
+// --- STYLED COMPONENTS ---
+
+const Card = ({ title, children, style = {} }) => (  
+  <div
+    style={{
+      backgroundColor: "#d52a2aff",
+      padding: "20px",
+      borderRadius: "8px",
+      boxShadow: "0 4px 12px rgba(0, 0, 0, 0.15)",
+      marginBottom: "25px",
+      ...style,
+    }}
+  
+    <h3
+      style={{
+        borderBottom: "2px solid #2980b9", // Darker border for contrast
+        paddingBottom: "10px",
+        marginBottom: "15px",
+        color: "#2c3e50",
+        fontSize: "1.5em",
+      }}
+    >
+      {title}    ś
+    </h3>
+    {children}
+  </div>
+);
+
+const Alert = ({ children, type }) => {
+    const colors = {
+        info: { bg: '#e8f3ff', border: '#3498db', text: '#2980b9' },
+        error: { bg: '#fbe4e4', border: '#c0392b', text: '#c0392b' },
+        warning: { bg: '#fff0e5', border: '#e67e22', text: '#d35400' },
+    };
+    const style = colors[type] || colors.info;
+
+    return (
+        <div
+            style={{
+                color: style.text,
+                backgroundColor: style.bg,
+                padding: "15px",
+                borderRadius: "5px",
+                marginTop: "20px",
+                marginBottom: "20px",
+                borderLeft: `5px solid ${style.border}`,
+                fontWeight: 500,
+            }}
+        >
+            {children}
+        </div>
+    );
+};
+
+// ... (StyledTable, StyledTh, StyledTd components are omitted for brevity, 
+// but assume they are the same as the previous version)
+
+// --- REPORT COMPONENTS ---
+
+const ColumnTable = ({ columns, totalRows }) => {
+  if (!columns || columns.length === 0) return null;
+
+  return (
+    <div style={{ overflowX: "auto" }}>
+      <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "0.95em" }}>
+        <thead>
+          <tr>
+            <th style={{ backgroundColor: "#ecf0f1", padding: "12px 15px", textAlign: "left" }}>Name</th>
+            <th style={{ backgroundColor: "#ecf0f1", padding: "12px 15px", textAlign: "left" }}>Dtype</th>
+            <th style={{ backgroundColor: "#ecf0f1", padding: "12px 15px", textAlign: "left" }}>Missing (%)</th>
+            <th style={{ backgroundColor: "#ecf0f1", padding: "12px 15px", textAlign: "left" }}>Unique Values</th>
+          </tr>
+        </thead>
+        <tbody>
+          {columns.map((col, i) => (
+            <tr key={i} style={{ backgroundColor: col.is_engineered ? '#f0fff0' : '#fff' }}>
+              <td style={{ border: "1px solid #dfe6e9", padding: "10px 15px", fontWeight: col.is_engineered ? 700 : 600, color: col.is_engineered ? '#27ae60' : '#333' }}>
+                {col.name || "N/A"} {col.is_engineered && '✨'}
+              </td>
+              <td style={{ border: "1px solid #dfe6e9", padding: "10px 15px" }}>{col.dtype || "N/A"}</td>
+              <td style={{ border: "1px solid #dfe6e9", padding: "10px 15px", color: col.missing > 0 ? '#c0392b' : '#27ae60' }}>
+                {totalRows > 0
+                  ? ((col.missing / totalRows) * 100).toFixed(1) + "%"
+                  : "N/A"}
+              </td>
+              <td style={{ border: "1px solid #dfe6e9", padding: "10px 15px" }}>{col.unique ?? "N/A"}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+};
+
+
+const NumericSummary = ({ summary }) => {
+    // ... (Same logic as the previous version for filtering numeric columns and rendering the table)
+    // --- OMITTED FOR BREVITY ---
+    if (!summary || Object.keys(summary).length === 0) {
+        return <p style={{ color: "#7f8c8d" }}>No data available for descriptive summary.</p>;
+    }
+    const numericColumns = Object.keys(summary).filter((col) => summary[col].mean !== undefined);
+
+    if (numericColumns.length === 0) {
+        return <p style={{ color: "#7f8c8d" }}>No numeric columns were found.</p>;
+    }
+
+    const stats = Object.keys(Object.values(summary[numericColumns[0]]));
+    
+    return (
+        <div style={{ overflowX: "auto" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "0.95em" }}>
+                <thead>
+                    <tr>
+                        <th style={{ backgroundColor: "#ecf0f1", padding: "12px 15px", textAlign: "left" }}>Statistic</th>
+                        {numericColumns.map((col) => (<th key={col} style={{ backgroundColor: "#ecf0f1", padding: "12px 15px", textAlign: "left" }}>{col}</th>))}
+                    </tr>
+                </thead>
+                <tbody>
+                    {stats.map((stat) => (
+                        <tr key={stat}>
+                            <td style={{ border: "1px solid #dfe6e9", padding: "10px 15px", fontWeight: 600, backgroundColor: "#f9f9f9" }}>{stat}</td>
+                            {numericColumns.map((col) => {
+                                const value = summary[col][stat];
+                                return (
+                                    <td key={`${col}-${stat}`} style={{ border: "1px solid #dfe6e9", padding: "10px 15px" }}>
+                                        {value !== undefined && value !== null
+                                            ? typeof value === "number"
+                                                ? stat === "count" || stat === "unique" ? Math.round(value).toLocaleString() : value.toFixed(3)
+                                                : String(value)
+                                            : "-"}
+                                    </td>
+                                );
+                            })}
+                        </tr>
+                    ))}
+                </tbody>
+            </table>
+        </div>
+    );
+};
+
+
+// --- MAIN APP COMPONENT ---
+
+export default function App() {
+  const [file, setFile] = useState(null);
+  const [analysis, setAnalysis] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+
+  const upload = async () => {
+    // ... (Same upload logic as previous version)
+    if (!file) { setError("Please select a file first."); return; }
+    const fd = new FormData();
+    fd.append("file", file);
+    setLoading(true);
+    setError(null);
+    setAnalysis(null);
+
+    try {
+      const res = await axios.post(BACKEND_URL, fd, {
+        headers: { "Content-Type": "multipart/form-data" },
+      });
+      setAnalysis(res.data);
+    } catch (err) {
+      setError(err?.response?.data?.detail || err.message || "An unknown error occurred during analysis.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    document.body.style.backgroundColor = "#f4f7f6";
+    document.body.style.fontFamily = "'Segoe UI', Tahoma, Geneva, Verdana, sans-serif";
+    document.body.style.color = "#333";
+    return () => { document.body.style.backgroundColor = null; document.body.style.fontFamily = null; document.body.style.color = null; };
+  }, []);
+
+  // Simple function to safely parse and highlight bold text from NLG
+  const renderNLG = (text) => {
+    if (!text) return null;
+    const parts = text.split(/(\*\*.*?\*\*)/g).filter(p => p.length > 0);
+    return parts.map((part, index) => {
+      if (part.startsWith('**') && part.endsWith('**')) {
+        return <strong key={index} style={{ color: '#2980b9' }}>{part.slice(2, -2)}</strong>;
+      }
+      return part;
+    });
+  };
+
+  return (
+    <div style={{ padding: 30, maxWidth: 1400, margin: "0 auto" }}>
+      <header style={{ textAlign: "center", marginBottom: "40px" }}>
+        <h1 style={{ color: "#2c3e50", fontSize: "2.5em" }}>
+          🧠 Smart Data Science Assistant
+        </h1>
+        <p style={{ color: "#7f8c8d", fontSize: "1.1em" }}>
+          Automated Feature Engineering, Outlier Detection, and Natural Language Summaries.
+        </p>
+      </header>
+
+      <Card title="File Upload & Analysis">
+        {/* ... (File upload and error rendering logic is omitted for brevity) ... */}
+        <div style={{ display: "flex", gap: "20px", alignItems: "center" }}>
+            <input type="file" accept=".xlsx,.xls,.csv" onChange={(e) => { setFile(e.target.files[0]); setAnalysis(null); setError(null); }}
+                style={{ padding: "10px", border: "1px solid #ccc", borderRadius: "4px" }}
+            />
+            <button onClick={upload} disabled={loading || !file} style={{ padding: "10px 20px", backgroundColor: "#3498db", color: "white", border: "none", borderRadius: "4px", cursor: "pointer", transition: "background-color 0.3s", }}>
+                {loading ? "Analyzing..." : "Upload & Analyze"}
+            </button>
+            {file && <p style={{ margin: 0, fontStyle: "italic", color: "#555" }}>Selected: **{file.name}**</p>}
+        </div>
+        {error && <Alert type="error">{error}</Alert>}
+      </Card>
+
+      {analysis && (
+        <>
+          <h2 style={{ color: "#2c3e50", marginBottom: "30px", fontSize: "2em" }}>
+            ✨ Automated Data Report
+          </h2>
+          
+          {/* Section 1: NLG Summary */}
+          <Card title="1. Cognitive Summary & Recommendations" style={{ border: '2px solid #2980b9' }}>
+            <p style={{ fontSize: '1.2em', lineHeight: 1.6, color: '#333' }}>
+                {renderNLG(analysis.nlg_summary)}
+            </p>
+            {analysis.outliers && analysis.outliers.length > 0 && (
+                <Alert type="warning">
+                    **Action Recommended:** {analysis.outliers.length} records were flagged as potential outliers. Inspect and clean these rows to prevent model bias.
+                </Alert>
+            )}
+          </Card>
+
+
+          {/* Section 2: Outlier Detection */}
+          <Card title="2. Anomaly Detection (Isolation Forest)">
+            {analysis.outliers && analysis.outliers.length > 0 ? (
+                <p>
+                    **{analysis.outliers.length} Outliers** detected. First 5 indices (zero-based): 
+                    <code style={{ backgroundColor: '#fbe4e4', padding: '2px 6px', borderRadius: '3px', margin: '0 5px' }}>
+                        {analysis.outliers.slice(0, 5).join(', ')}
+                    </code>
+                </p>
+            ) : (
+                <Alert type="info">No significant anomalies detected in the numeric columns.</Alert>
+            )}
+          </Card>
+          
+          
+          {/* Section 3: Dataset Overview */}
+          <Card title="3. Dataset Overview (Meta & Feature Engineering)">
+            <p style={{ fontWeight: 500, marginBottom: "20px" }}>
+              The dataset has **{analysis.meta.rows.toLocaleString()}** rows and{" "}
+              **{analysis.meta.cols}** columns (including **newly engineered features**).
+            </p>
+            <ColumnTable columns={analysis.meta.columns} totalRows={analysis.meta.rows} />
+          </Card>
+
+          {/* Section 4: Summary Statistics */}
+          <Card title="4. Descriptive Statistics (Original & Engineered)">
+            <NumericSummary summary={analysis.summary} />
+          </Card>
+
+          {/* Section 5: Visualizations */}
+          <Card title="5. Visualizations (Graphs & Charts)" style={{ marginBottom: "50px" }}>
+            <div
+              style={{
+                display: "flex",
+                flexWrap: "wrap",
+                gap: "30px",
+                justifyContent: "space-around",
+              }}
+            >
+              {analysis.figures && analysis.figures.length > 0 ? (
+                analysis.figures.map((fig) => (
+                  <div
+                    key={fig.id}
+                    style={{
+                      flex: "1 1 45%",
+                      minWidth: 380,
+                      maxWidth: 650,
+                      backgroundColor: '#f9f9f9',
+                      padding: '10px',
+                      borderRadius: '6px',
+                      boxShadow: '0 2px 4px rgba(0,0,0,0.05)'
+                    }}
+                  >
+                    <Plot
+                      data={fig.figure.data || []}
+                      layout={{
+                        ...fig.figure.layout,
+                        autosize: true,
+                        margin: { t: 50, b: 50, l: 50, r: 20 },
+                      }}
+                      config={{ displayModeBar: false, responsive: true }}
+                      style={{ width: "100%", height: fig.id === 'heatmap_corr' ? 550 : 450 }}
+                    />
+                  </div>
+                ))
+              ) : (
+                <p style={{ color: "#7f8c8d" }}>
+                  No suitable data (numeric or categorical) to generate charts.
+                </p>
+              )}
+            </div>
+          </Card>
+        </>
+      )}
+    </div>
+  );
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+import React, { useState, useEffect } from "react";
+import axios from "axios";
+import Plot from "react-plotly.js";
+
+// NOTE: This URL assumes a local FastAPI or similar server is running on port 8000.
+const BACKEND_URL = "http://localhost:8000/analyze";
+
+export default function App() {
+  const [file, setFile] = useState(null);
+  const [analysis, setAnalysis] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+  const [darkMode, setDarkMode] = useState(false);
+  // State to manage the active view: 'input' or 'analysis'
+  const [view, setView] = useState('input'); 
+
+  // Theme object for managing styling across light/dark modes
+  const theme = {
+    background: darkMode ? "#0f172a" : "#f5f7fa",
+    cardBg: darkMode ? "#1e293b" : "#fff",
+    text: darkMode ? "#f8fafc" : "#1f3d7a",
+    subtext: darkMode ? "#94a3b8" : "#6c7a89",
+    border: darkMode ? "#334155" : "#e5e7eb",
+    inputBg: darkMode ? "#1e293b" : "#f8f9fa",
+    primary: darkMode ? "#38bdf8" : "#1f78c1"
+  };
+
+  // Handler for uploading the file and triggering analysis
+  const upload = async () => {
+    if (!file) {
+      setError("Please select a file first.");
+      return;
+    }
+
+    const fd = new FormData();
+    fd.append("file", file);
+    setLoading(true);
+    setError(null);
+    setAnalysis(null);
+    // Switch to analysis view once upload starts (it will show the loading state)
+    setView('analysis'); 
+
+    try {
+      const res = await axios.post(BACKEND_URL, fd, {
+        headers: { "Content-Type": "multipart/form-data" },
+      });
+      setAnalysis(res.data);
+      // After success, switch to the input view to show the data table preview
+      setView('input'); 
+    } catch (err) {
+      const detail = err?.response?.data?.detail || err.message || "An unknown error occurred during analysis.";
+      setError(detail);
+      setView('input'); // Switch back to input on error
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Effect to set global body styles based on the theme
+  useEffect(() => {
+    document.body.style.backgroundColor = theme.background;
+    document.body.style.fontFamily =
+      "'Inter', 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif";
+    document.body.style.color = theme.text;
+  }, [darkMode, theme.background, theme.text]);
+
+  // Reusable component for section cards
+  const Card = ({ title, children }) => (
+    <div
+      style={{
+        background: theme.cardBg,
+        padding: "25px",
+        borderRadius: "14px",
+        boxShadow: darkMode
+          ? "0 0 15px rgba(0,0,0,0.4)"
+          : "0 8px 24px rgba(0, 0, 0, 0.05)",
+        marginBottom: "30px",
+        transition: "all 0.3s ease",
+        border: `1px solid ${theme.border}`,
+      }}
+    >
+      <h3
+        style={{
+          borderBottom: `2px solid ${theme.primary}`,
+          paddingBottom: "10px",
+          marginBottom: "20px",
+          color: theme.text,
+          fontSize: "1.5em",
+          fontWeight: 600,
+        }}
+      >
+        {title}
+      </h3>
+      {children}
+    </div>
+  );
+
+  // Reusable component for error messages
+  const Alert = ({ children }) => (
+    <div
+      style={{
+        backgroundColor: darkMode ? "#f87171" : "#fdecea",
+        color: darkMode ? "#fff" : "#c0392b",
+        padding: "12px",
+        borderRadius: "6px",
+        marginTop: "15px",
+        fontWeight: 500,
+      }}
+    >
+      {children}
+    </div>
+  );
+
+  // Reusable component for the data table
+  const StyledTable = ({ children }) => (
+    <table
+      style={{
+        width: "100%",
+        borderCollapse: "collapse",
+        fontSize: "0.95em",
+        color: theme.text,
+      }}
+    >
+      {children}
+    </table>
+  );
+
+  // Reusable component for table headers
+  const StyledTh = ({ children, isLetterRow = false, style = {} }) => (
+    <th
+      style={{
+        backgroundColor: isLetterRow ? (darkMode ? '#0f172a' : '#e2e8f0') : (darkMode ? "#1e293b" : "#f1f5fa"),
+        padding: "12px 15px",
+        textAlign: "left",
+        color: isLetterRow ? theme.subtext : theme.text,
+        borderBottom: isLetterRow ? 'none' : `1px solid ${theme.border}`,
+        position: 'sticky', // Make header row sticky for scrolling
+        top: isLetterRow ? 0 : '38px',
+        zIndex: 10,
+        ...style,
+      }}
+    >
+      {children}
+    </th>
+  );
+
+  // Reusable component for table data cells
+  const StyledTd = ({ children, style = {} }) => (
+    <td
+      style={{
+        padding: "10px 15px",
+        textAlign: "left",
+        borderBottom: `1px solid ${theme.border}`,
+        backgroundColor: theme.cardBg, 
+        ...style,
+      }}
+    >
+      {children}
+    </td>
+  );
+  
+  // Component for displaying raw data sample, mimicking the screenshot
+  const RawDataView = ({ data, columns }) => {
+    if (!data || data.length === 0) return <p style={{ color: theme.subtext, padding: '20px' }}>No data sample available. Upload a file to see a preview here.</p>;
+
+    const maxColumns = 10; // Limit columns for visual display
+    const displayColumns = columns.slice(0, maxColumns);
+    const hasMoreColumns = columns.length > maxColumns;
+    
+    // Generate headers with letters (A, B, C...)
+    const tableHeaders = displayColumns.map((col, index) => ({
+      letter: String.fromCharCode(65 + index), 
+      name: col 
+    }));
+
+    return (
+      <div 
+        style={{ 
+          overflow: "auto", 
+          maxHeight: '70vh', 
+          background: theme.cardBg, 
+          borderRadius: '6px',
+          border: `1px solid ${theme.border}`,
+          boxShadow: darkMode ? "inset 0 0 10px rgba(0,0,0,0.2)" : "inset 0 0 10px rgba(0,0,0,0.05)"
+        }}
+      >
+        <StyledTable>
+          <thead style={{ position: 'sticky', top: 0, zIndex: 11 }}>
+            {/* Row 1: Column Letters (A, B, C...) - Sticky */}
+            <tr style={{ position: 'sticky', top: 0, zIndex: 11 }}>
+              <StyledTh isLetterRow={true} style={{ minWidth: '60px', left: 0, position: 'sticky' }}>#</StyledTh> 
+              {tableHeaders.map((header) => (
+                <StyledTh key={`letter-${header.letter}`} isLetterRow={true} style={{ fontSize: '0.8em', fontWeight: 500 }}>
+                  {header.letter}
+                </StyledTh>
+              ))}
+              {hasMoreColumns && <StyledTh isLetterRow={true} style={{ fontSize: '0.8em', fontWeight: 500 }}>...</StyledTh>}
+            </tr>
+            {/* Row 2: Column Names - Sticky */}
+            <tr style={{ position: 'sticky', top: '38px', zIndex: 11 }}>
+              <StyledTh style={{ fontWeight: 600, minWidth: '60px', left: 0, position: 'sticky', backgroundColor: darkMode ? "#1e293b" : "#f1f5fa" }}>Row ID</StyledTh>
+              {tableHeaders.map((header) => (
+                <StyledTh key={`name-${header.name}`} style={{ fontWeight: 600, minWidth: '120px' }}>
+                  {header.name}
+                </StyledTh>
+              ))}
+              {hasMoreColumns && <StyledTh style={{ fontWeight: 600, minWidth: '50px' }}>+{columns.length - maxColumns} more</StyledTh>}
+            </tr>
+          </thead>
+          <tbody>
+            {data.map((row, rowIndex) => (
+              <tr key={rowIndex}>
+                {/* Row Number (1, 2, 3...) - Sticky on the left */}
+                <StyledTd 
+                    style={{ 
+                        fontWeight: 'bold', 
+                        backgroundColor: darkMode ? '#0f172a' : '#f1f5fa', 
+                        left: 0, 
+                        position: 'sticky',
+                        borderRight: `1px solid ${theme.border}`,
+                    }}
+                >
+                  {rowIndex + 1}
+                </StyledTd> 
+                {displayColumns.map((colName) => (
+                  <StyledTd key={`${rowIndex}-${colName}`}>
+                    {/* Convert to string and limit length for clean display */}
+                    {String(row[colName] ?? 'N/A').substring(0, 50)} 
+                  </StyledTd>
+                ))}
+                 {hasMoreColumns && <StyledTd>...</StyledTd>}
+              </tr>
+            ))}
+          </tbody>
+        </StyledTable>
+      </div>
+    );
+  };
+
+  return (
+    <div
+      style={{
+        padding: 30,
+        maxWidth: 1400,
+        margin: "0 auto",
+        minHeight: "100vh",
+      }}
+    >
+      <header
+        style={{
+          textAlign: "center",
+          marginBottom: "40px",
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+          flexWrap: "wrap",
+        }}
+      >
+        <h1
+          style={{
+            color: theme.text,
+            fontSize: "2.8em",
+            fontWeight: 700,
+            margin: 0,
+          }}
+        >
+          📊 Advanced Data Analyzer
+        </h1>
+        <button
+          onClick={() => setDarkMode((prev) => !prev)}
+          style={{
+            padding: "10px 16px",
+            background: darkMode ? "#334155" : theme.primary,
+            color: "#fff",
+            border: "none",
+            borderRadius: "6px",
+            cursor: "pointer",
+            fontWeight: 500,
+            transition: "background-color 0.3s ease",
+          }}
+        >
+          {darkMode ? "☀️ Light Mode" : "🌙 Dark Mode"}
+        </button>
+      </header>
+
+      {/* Main Tabbed Interface */}
+      <div style={{ padding: "20px", borderRadius: "14px", background: theme.cardBg, border: `1px solid ${theme.border}`, boxShadow: darkMode ? "0 0 15px rgba(0,0,0,0.4)" : "0 8px 24px rgba(0, 0, 0, 0.05)", }}>
+        <div style={{ display: 'flex', borderBottom: `2px solid ${theme.border}`, marginBottom: '20px' }}>
+            {/* Input Data Tab Button */}
+            <button
+                onClick={() => setView('input')}
+                style={{
+                    padding: "10px 20px",
+                    cursor: "pointer",
+                    fontWeight: 600,
+                    border: 'none',
+                    borderBottom: view === 'input' ? `3px solid ${theme.primary}` : '3px solid transparent',
+                    background: 'none',
+                    color: view === 'input' ? theme.text : theme.subtext,
+                    transition: 'color 0.3s',
+                }}
+            >
+                Input Data
+            </button>
+            {/* Analysis Tab Button */}
+            <button
+                onClick={() => setView('analysis')}
+                disabled={!analysis}
+                style={{
+                    padding: "10px 20px",
+                    cursor: analysis ? "pointer" : "not-allowed",
+                    fontWeight: 600,
+                    border: 'none',
+                    borderBottom: view === 'analysis' ? `3px solid ${theme.primary}` : '3px solid transparent',
+                    background: 'none',
+                    color: view === 'analysis' ? theme.text : theme.subtext,
+                    transition: 'color 0.3s',
+                    opacity: analysis ? 1 : 0.5,
+                }}
+            >
+                Analysis
+            </button>
+        </div>
+        
+        {/* === INPUT DATA VIEW CONTENT === */}
+        {view === 'input' && (
+            <>
+                <div style={{ display: "flex", gap: "20px", alignItems: "center", flexWrap: 'wrap', marginBottom: '20px' }}>
+                    <input
+                        type="file"
+                        accept=".xlsx,.xls,.csv"
+                        onChange={(e) => {
+                            setFile(e.target.files[0]);
+                            setAnalysis(null);
+                            setError(null);
+                        }}
+                        style={{
+                            padding: "10px",
+                            border: `1px solid ${theme.border}`,
+                            borderRadius: "6px",
+                            background: theme.inputBg,
+                            color: theme.text,
+                            flexGrow: 1,
+                            minWidth: '200px'
+                        }}
+                    />
+                    <button
+                        onClick={upload}
+                        disabled={loading || !file}
+                        style={{
+                            padding: "10px 20px",
+                            backgroundColor: theme.primary,
+                            color: "#fff",
+                            border: "none",
+                            borderRadius: "6px",
+                            cursor: loading || !file ? "not-allowed" : "pointer",
+                            fontWeight: 500,
+                            opacity: loading || !file ? 0.7 : 1,
+                            transition: "opacity 0.3s ease, background-color 0.3s ease",
+                        }}
+                    >
+                        {loading ? "Analyzing..." : "Upload & Analyze"}
+                    </button>
+                </div>
+                {error && <Alert>{error}</Alert>}
+                
+                {/* Display the raw data sample after a successful analysis */}
+                <h2 style={{ fontSize: '1.4em', fontWeight: 600, color: theme.text, marginTop: '20px', marginBottom: '10px' }}>
+                    {analysis ? `Previewing Data Sample (${analysis.column_names.length} columns, showing first 50 rows)` : "Data Preview (Upload a file to see a sample)"}
+                </h2>
+                {analysis && analysis.raw_data_sample ? (
+                    <RawDataView 
+                        data={analysis.raw_data_sample} 
+                        columns={analysis.column_names} 
+                    />
+                ) : (
+                    <div style={{ padding: '20px', border: `1px solid ${theme.border}`, borderRadius: '6px', backgroundColor: theme.inputBg }}>
+                        <p style={{ color: theme.subtext, textAlign: 'center' }}>
+                            {file ? `File selected: ${file.name}. Click 'Upload & Analyze' to process and see the preview.` : "No file uploaded yet."}
+                        </p>
+                    </div>
+                )}
+            </>
+        )}
+        
+        {/* === ANALYSIS VIEW CONTENT === */}
+        {view === 'analysis' && loading && (
+            <p style={{ color: theme.subtext, padding: '20px', textAlign: 'center' }}>Loading analysis results...</p>
+        )}
+
+        {view === 'analysis' && analysis && (
+            <>
+              {/* 1. Dataset Overview Table */}
+              <Card title="1. Dataset Overview">
+                <p style={{ fontWeight: 500, color: theme.text, marginBottom: '15px' }}>
+                  Dataset has **{analysis.meta.rows}** rows and{" "}
+                  **{analysis.meta.cols}** columns.
+                </p>
+                <div style={{ overflowX: "auto" }}>
+                  <StyledTable>
+                    <thead>
+                      <tr>
+                        <StyledTh style={{position: 'relative', top: 'unset'}}>Name</StyledTh>
+                        <StyledTh style={{position: 'relative', top: 'unset'}}>Dtype</StyledTh>
+                        <StyledTh style={{position: 'relative', top: 'unset'}}>Missing (%)</StyledTh>
+                        <StyledTh style={{position: 'relative', top: 'unset'}}>Unique Values</StyledTh>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {analysis.meta.columns.map((col, i) => (
+                        <tr key={i}>
+                          <StyledTd>{col.name}</StyledTd>
+                          <StyledTd>{col.dtype}</StyledTd>
+                          <StyledTd>
+                            {(
+                              (col.missing / analysis.meta.rows) * 100
+                            ).toFixed(1)}
+                            %
+                          </StyledTd>
+                          <StyledTd>{col.unique}</StyledTd>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </StyledTable>
+                </div>
+              </Card>
+
+              {/* 2. AI-Powered Analysis Summary */}
+              <Card title="2. AI-Powered Analysis Summary">
+                <div style={{ color: theme.text, lineHeight: 1.8, whiteSpace: 'pre-wrap' }} dangerouslySetInnerHTML={{ __html: analysis.nlg_summary.replace(/\*\*/g, '<strong>').replace(/\n/g, '<br/>') }} />
+                <p style={{ fontSize: '0.9em', color: theme.subtext, marginTop: '20px' }}>
+                    *This summary is generated by a large language model based on the statistical report above and may not reflect all nuances of the data.
+                </p>
+              </Card>
+
+
+              {/* 3. Visualizations */}
+              <Card title="3. Visualizations">
+                <div
+                  style={{
+                    display: "flex",
+                    flexWrap: "wrap",
+                    gap: "30px",
+                    justifyContent: "space-around",
+                  }}
+                >
+                  {analysis.figures.map((fig) => (
+                    <div
+                      key={fig.id}
+                      style={{
+                        flex: "1 1 45%",
+                        minWidth: 380,
+                        maxWidth: 650,
+                        backgroundColor: theme.cardBg,
+                        padding: "10px",
+                        borderRadius: "8px",
+                        border: `1px solid ${theme.border}`,
+                      }}
+                    >
+                      {/* Plotly Chart rendering */}
+                      <Plot
+                        data={fig.figure.data || []}
+                        layout={{
+                          ...fig.figure.layout,
+                          autosize: true,
+                          paper_bgcolor: theme.cardBg,
+                          plot_bgcolor: theme.cardBg,
+                          font: { color: theme.text },
+                          margin: { t: 50, b: 50, l: 50, r: 20 },
+                        }}
+                        config={{ displayModeBar: false, responsive: true }}
+                        style={{
+                          width: "100%",
+                          height: fig.id === "heatmap_corr" ? 550 : 450,
+                        }}
+                      />
+                    </div>
+                  ))}
+                </div>
+              </Card>
+            </>
+        )}
+        
+        {view === 'analysis' && !analysis && !loading && (
+            <p style={{ color: theme.subtext, padding: '20px', textAlign: 'center' }}>Upload a file and click 'Upload & Analyze' to view the analysis.</p>
+        )}
+
+      </div>
+    </div>
+  );
+}
+<- good ->
